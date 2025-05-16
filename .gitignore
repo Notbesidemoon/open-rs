@@ -177,3 +177,8 @@ cython_debug/
 notebooks/
 data/
 sh/
+
+wandb/
+results/
+aother/
+down_data.py

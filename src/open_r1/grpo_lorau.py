@@ -1,0 +1,270 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+import json
+import datasets
+import torch
+import transformers
+from datasets import load_dataset
+from transformers import set_seed
+from transformers.trainer_utils import get_last_checkpoint
+from transformers import TrainerCallback, TrainingArguments
+import wandb
+
+from configs import GRPOConfig
+
+from peft import LoraConfig
+from rewards_u import (
+    accuracy_reward,
+    format_reward,
+    tag_count_reward,
+    uncertainty_reward,
+)
+from utils import get_tokenizer
+from utils.callbacks import get_callbacks
+from utils.wandb_logging import init_wandb_training
+from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GRPOScriptArguments(ScriptArguments):
+    """
+    Script arguments for the GRPO training script.
+
+    Args:
+        reward_funcs (`list[str]`):
+            List of reward functions. Possible values: 'accuracy', 'format', 'tag_count', 'uncertainty'.
+    """
+
+    reward_funcs: list[str] = field(
+        default_factory=lambda: ["accuracy", "format", "tag_count", "uncertainty"],
+        metadata={
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'tag_count', 'uncertainty'"
+        },
+    )
+
+
+def main(script_args, training_args, model_args):
+    # Set seed for reproducibility
+    set_seed(training_args.seed)
+
+    ###############
+    # Setup logging
+    ###############
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    datasets.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
+
+    # Log on each process a small summary
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    logger.info(f"Model parameters {model_args}")
+    logger.info(f"Script parameters {script_args}")
+    logger.info(f"Training parameters {training_args}")
+
+    # Check for last checkpoint
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir):
+        last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+        logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+
+    if "wandb" in training_args.report_to:
+        init_wandb_training(training_args)
+
+    # Load the dataset
+    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+
+    ################
+    # Load tokenizer
+    ################
+    tokenizer = get_tokenizer(model_args, training_args)
+    
+    # 检查并设置 pad_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.info(f"Tokenizer does not have a pad token, setting it to EOS token: {tokenizer.eos_token}")
+
+    # Get reward functions
+    REWARD_FUNCS_REGISTRY = {
+        "accuracy": accuracy_reward,
+        "format": format_reward,
+        "tag_count": tag_count_reward,
+        "uncertainty": uncertainty_reward,
+    }
+    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
+
+    # Format into conversation
+    def make_conversation(example, model_type="llama"):
+        """创建并格式化对话，根据模型类型应用相应的chat template。
+        Args:
+            example: 数据样本
+            model_type: 模型类型，默认为"llama"
+            
+        Returns:
+            dict: 带有格式化prompt的字典
+        """
+        messages = []
+        if training_args.system_prompt is not None:
+            messages.append({"role": "system", "content": training_args.system_prompt})
+        messages.append({"role": "user", "content": example["question"]})
+    
+        return {"prompt": messages, "solution": example["answers"]["text"][0]}
+    
+    # select the dataset, random 2000 samples for training
+    if 'triviaqa' in script_args.dataset_name.lower():
+        dataset = dataset["unmodified"].shuffle(seed=42).select(range(2000))
+    else:
+        dataset = dataset["train"].shuffle(seed=42).select(range(2000))
+    dataset = dataset.map(make_conversation, batched=False)
+    # 删除dataset 除了prompt 和 solution 以外的字段
+    dataset = dataset.remove_columns([col for col in dataset.column_names if col not in ['prompt', 'solution']])
+
+    # 打印几个样本，确认格式没有问题
+    logger.info(f"Dataset sample: {dataset[0]}")
+    logger.info(f"Prompt format example: {dataset[0]['prompt'][:100]}...")
+
+    logger.info("*** Initializing model kwargs ***")
+    torch_dtype = (
+        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+    )
+    model_kwargs = dict(
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+        attn_implementation=model_args.attn_implementation,
+        torch_dtype=torch_dtype,
+        use_cache=False if training_args.gradient_checkpointing else True,
+    )
+    training_args.model_init_kwargs = model_kwargs
+
+    #############################
+    # Initialize the GRPO trainer
+    #############################
+    
+    # 只使用标准回调
+    callbacks = get_callbacks(training_args, model_args)
+    # 加载 lora 配置
+    lora_rank = training_args.lora_rank
+    if lora_rank is None:
+        lora_rank = 8
+        logger.warning(f"lora_rank is None, using default value: {lora_rank}")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = model_args.model_name_or_path,
+        max_seq_length = 256,
+        load_in_4bit = False, # False for LoRA 16bit
+        fast_inference = True, # Enable vLLM fast inference
+        max_lora_rank = lora_rank,
+        gpu_memory_utilization = 0.6, # Reduce if out of memory
+    )
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = lora_rank, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ], # Remove QKVO if out of memory
+        lora_alpha = lora_rank,
+        use_gradient_checkpointing = "unsloth", # Enable long context finetuning
+        random_state = 3407,
+    )
+
+    trainer = GRPOTrainer(
+        model=model_args.model_name_or_path,
+        reward_funcs=reward_funcs,
+        args=training_args,
+        train_dataset=dataset,  # 使用整个处理后的数据集
+        eval_dataset=None,  # 因为我们之前处理了整个数据集
+        peft_config=get_peft_config(model_args),
+        callbacks=callbacks,
+        processing_class=tokenizer,
+    )
+
+    ###############
+    # Training loop
+    ###############
+    logger.info("*** Train ***")
+    checkpoint = None
+    if training_args.resume_from_checkpoint is not None:
+        checkpoint = training_args.resume_from_checkpoint
+    elif last_checkpoint is not None:
+        checkpoint = last_checkpoint
+    
+    train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    metrics = train_result.metrics
+    metrics["train_samples"] = len(dataset)
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+    trainer.save_state()
+
+    ##################################
+    # Save model and create model card
+    ##################################
+    logger.info("*** Save model ***")
+    trainer.save_model(training_args.output_dir)
+    logger.info(f"Model saved to {training_args.output_dir}")
+
+    # Save everything else on main process
+    kwargs = {
+        "dataset_name": script_args.dataset_name,
+        "tags": ["uncertainty"],
+    }
+    if trainer.accelerator.is_main_process:
+        try:
+            trainer.create_model_card(**kwargs)
+        except UnicodeDecodeError as e:
+            logger.warning(f"跳过模型卡生成，编码错误: {e}")
+        # Restore k,v cache for fast inference
+        trainer.model.config.use_cache = True
+        trainer.model.config.save_pretrained(training_args.output_dir)
+
+    ##########
+    # Evaluate
+    ##########
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+        metrics = trainer.evaluate()
+        metrics["eval_samples"] = len(dataset)
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+    #############
+    # push to hub
+    #############
+    if training_args.push_to_hub:
+        logger.info("Pushing to hub...")
+        trainer.push_to_hub(**kwargs)
+
+
+if __name__ == "__main__":
+    parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
+    script_args, training_args, model_args = parser.parse_args_and_config()
+    main(script_args, training_args, model_args)

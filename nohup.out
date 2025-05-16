@@ -1,0 +1,8 @@
+\total_sample: 3610
+correct_sample: 514
+accuracy: 0.14238227146814406
+AED: 0.704160627747762
+Refusal: 1512
+拒绝率: 0.4188365650969529
+结果已保存到: evaluate/qwen/nq/pararel_trained_rft_qwen_nq_results_0.05temp.json
+[rank0]:[W507 03:14:17.182014040 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())

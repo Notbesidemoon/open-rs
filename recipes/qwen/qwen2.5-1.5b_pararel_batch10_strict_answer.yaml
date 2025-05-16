@@ -1,0 +1,70 @@
+# Model arguments
+model_name_or_path: /data1/model/Qwen/Qwen2.5-1.5B-Instruct/
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2   # eager
+
+# Data training arguments
+dataset_name: /data/ah/code/rl/open-rs/dataset/pararel_training.json  #TimoImhof/TriviaQA-in-SQuAD-format
+
+system_prompt: |
+  You are a faithful assistant. The user asks a question, and you provide the answer and your confidence expressed in sure or unsure. Respond in the following format:
+
+  <answer>
+  ...
+  </answer>
+
+  <confidence>
+  sure or unsure
+  </confidence>
+
+# GRPO trainer config
+bf16: true
+use_vllm: true
+vllm_device: auto
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.7
+# vllm_max_model_len: 4608
+do_eval: false
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+hub_model_id: OpenRS-GRPO
+hub_strategy: every_save
+learning_rate: 1.0e-06
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+max_prompt_length: 256
+max_completion_length: 128
+# max_steps: 500
+num_generations: 10
+num_train_epochs: 1
+output_dir: results/qwen/pararel_batch10_strict_answer_origin_data
+overwrite_output_dir: true
+per_device_eval_batch_size: 10
+per_device_train_batch_size: 10
+push_to_hub: false
+report_to:
+- wandb
+reward_funcs:
+- uncertainty
+- accuracy
+- tag_count
+- format
+reward_weights:
+- 1.0
+- 2.0
+- 1.0
+- 1.0
+save_strategy: "steps"
+save_steps: 300
+seed: 42
+temperature: 1.0
+warmup_ratio: 0.05
